@@ -1,0 +1,9 @@
+# Secrets : ne jamais publier
+.streamlit/secrets.toml
+.env
+
+# Fichiers locaux
+__pycache__/
+*.pyc
+.venv/
+*.zip
