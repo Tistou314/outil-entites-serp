@@ -310,8 +310,13 @@ with onglet1:
             st.dataframe(pd.DataFrame(st.session_state["etat"]),
                          hide_index=True, width="stretch")
 
-        seuil = st.slider("Présent dans au moins … pages", 1, max(n, 1),
-                          value=max(1, math.ceil(n / 3)))
+        if n > 1:
+            seuil = st.slider("Présent dans au moins … pages", 1, n,
+                              value=max(1, math.ceil(n / 3)))
+        else:
+            seuil = 1
+            st.caption("Une seule page analysée : tous ses éléments sont repris. "
+                       "Ajoutez d'autres URLs pour dégager un socle commun.")
         st.caption("Décochez ce qui est hors sujet (faux sens, pays étrangers, "
                    "mots trop génériques) avant de vérifier un brouillon.")
 
