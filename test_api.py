@@ -15,6 +15,10 @@ print("Jeton trouvé :", bool(token))
 t0 = time.time()
 client = ApifyClient(token)
 run = client.actor(actor).call(run_input={"urls": [url]})
-print(f"Statut {run.get('status')} en {time.time() - t0:.1f} s")
-for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+if isinstance(run, dict):  # apify-client 1.x/2.x
+    dataset_id, statut = run.get("defaultDatasetId"), run.get("status")
+else:                      # apify-client 3.x
+    dataset_id, statut = run.default_dataset_id, getattr(run.status, "value", run.status)
+print(f"Statut {statut} en {time.time() - t0:.1f} s")
+for item in client.dataset(dataset_id).iterate_items():
     print(json.dumps(item, ensure_ascii=False, indent=2)[:3000])

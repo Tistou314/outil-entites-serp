@@ -174,6 +174,20 @@ def _cache_apify():
     return {}
 
 
+def infos_run(run):
+    """(identifiant du dataset, statut) d'une exécution : dictionnaire avec
+    apify-client 1.x/2.x, objet avec apify-client 3.x."""
+    if run is None:
+        return None, None
+    if isinstance(run, dict):
+        dataset_id, statut = run.get("defaultDatasetId"), run.get("status")
+    else:
+        dataset_id = getattr(run, "default_dataset_id", None)
+        statut = getattr(run, "status", None)
+    statut = getattr(statut, "value", statut)  # énumération en 3.x
+    return dataset_id, (str(statut) if statut is not None else None)
+
+
 def analyser_urls(urls):
     """Lance l'actor Apify sur les URLs absentes du cache ; renvoie
     ({url: [entités]}, {url: erreur}, éléments bruts du dernier appel)."""
@@ -186,11 +200,12 @@ def analyser_urls(urls):
         print(f"→ Apify : {len(a_faire)} URL(s) envoyée(s)", flush=True)
         t0 = time.time()
         run = client.actor(ACTOR_ID).call(run_input={"urls": a_faire})
-        if not run or not run.get("defaultDatasetId"):
+        dataset_id, statut = infos_run(run)
+        if not dataset_id:
             raise RuntimeError("l'actor Apify n'a renvoyé aucun résultat")
-        if run.get("status") not in (None, "SUCCEEDED"):
-            raise RuntimeError(f"exécution Apify terminée avec le statut {run['status']}")
-        bruts = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+        if statut not in (None, "SUCCEEDED"):
+            raise RuntimeError(f"exécution Apify terminée avec le statut {statut}")
+        bruts = [dict(x) for x in client.dataset(dataset_id).iterate_items()]
         print(f"← {len(bruts)} élément(s) en {time.time() - t0:.1f} s", flush=True)
         lus = lire_items(bruts)
         for u in a_faire:
