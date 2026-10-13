@@ -342,7 +342,7 @@ def tableau_editable(lignes, cle_session, nom_csv, colonnes_lien=()):
 
 
 urls_brutes = st.text_area(
-    "URLs du top 10, une par ligne (copiées depuis le guide YTG)",
+    "URLs des sources à analyser",
     height=200, placeholder="https://www.exemple.fr/page-1\nhttps://www.exemple.fr/page-2")
 
 if st.button("Analyser la SERP", type="primary"):
