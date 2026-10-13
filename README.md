@@ -1,49 +1,59 @@
 # Entités SERP — prototype
 
 Outil pour les rédacteurs : à partir des URLs du top 10 (copiées depuis le guide YTG),
-il liste ce que les pages concurrentes traitent, en deux familles, puis vérifie
-qu'un brouillon les couvre :
+il liste les entités du Knowledge Graph que Google associe aux pages concurrentes,
+puis vérifie qu'un brouillon les couvre.
 
-- **Entités nommées** : lieux, marques, organismes, personnes (avec MID Knowledge Graph) ;
-- **Concepts du sujet** : noms communs du métier (toiture, tuiles, démoussage…).
+L'analyse des pages passe par l'actor Apify **Entity SEO API**
+(ID `EJWI6K70hv3VyAHvp`) : pour chaque URL, il renvoie les entités du Knowledge Graph
+avec leur identifiant, une description et un score de 0 à 100.
 
 ## Installation (Windows, PowerShell)
 
 ```powershell
 pip install -r requirements.txt
-$env:GOOGLE_NL_API_KEY="AIza...votre_clé..."
+$env:APIFY_TOKEN="apify_api_...votre_jeton..."
 streamlit run app.py
 ```
 
 L'outil s'ouvre dans le navigateur (http://localhost:8501).
+Le jeton se trouve dans la console Apify : Settings > API & Integrations.
 
-Pour ne pas retaper la clé : créer `.streamlit/secrets.toml` à côté de `app.py` :
+Pour ne pas retaper le jeton : créer `.streamlit/secrets.toml` à côté de `app.py` :
 
 ```toml
-GOOGLE_NL_API_KEY = "AIza...votre_clé..."
+APIFY_TOKEN = "apify_api_...votre_jeton..."
 ```
+
+Pour utiliser un autre actor qui prend la même entrée (`{"urls": [...]}`), définir
+`APIFY_ACTOR_ID`.
+
+Test rapide hors Streamlit (affiche la réponse brute) : `python test_api.py [url]`.
 
 ## Utilisation
 
 1. **Entités à couvrir** : coller les URLs du top 10, cliquer sur « Analyser la SERP ».
    Régler le seuil (nombre minimum de pages qui citent l'entité), décocher les entités
    hors sujet.
-2. **Vérifier mon brouillon** : coller le texte, cliquer sur « Vérifier la couverture ».
-   L'outil affiche le taux de couverture et les entités à ajouter.
+2. **Vérifier mon brouillon** : coller le texte, cliquer sur « Analyser mon brouillon ».
+   L'outil affiche la couverture et les entités à ajouter ou à développer.
 
 ## Notes
 
-- Les entités nommées sont celles que l'API rattache au Knowledge Graph (avec un MID).
-- Les concepts sont les noms communs détectés par l'API, regroupés entre les pages
-  (singulier/pluriel, casse, accents). Les mots de navigation (contact, page, cookie…)
-  sont écartés ; décochez à la main ceux qui restent trop génériques.
-- Un élément est compté comme couvert si l'API le détecte dans le brouillon, ou si son
+- Toutes les URLs partent dans une seule exécution de l'actor ; compter de quelques
+  secondes à quelques minutes selon le nombre de pages.
+- Les résultats par URL sont gardés en cache 24 h pour ne pas refacturer les mêmes pages
+  (les échecs ne sont pas mis en cache).
+- Le texte des pages est aussi récupéré en local, uniquement pour montrer un exemple
+  d'emploi par un concurrent et compter les emplois par page (« À développer »).
+- Le brouillon n'est envoyé à aucune API : une entité est comptée comme couverte si son
   nom y figure (au singulier ou au pluriel).
-- Coût : environ 1 $ pour 100 pages analysées au-delà du quota gratuit mensuel
-  (API Cloud Natural Language, analyse des entités).
-- Les résultats par URL sont gardés en cache 24 h pour ne pas refacturer les mêmes pages.
-- Avant un déploiement chez Solocal : clé sur un projet Google Cloud Solocal, validation
-  DSI (les brouillons sont envoyés à l'API Google), hébergement interne.
+- La réponse brute d'Apify est consultable dans l'onglet 1 (« Réponse brute d'Apify »)
+  pour contrôler les champs renvoyés.
+- Coût : facturé par Apify selon la tarification de l'actor (les URLs en échec ne sont
+  pas facturées).
+- Avant un déploiement chez Solocal : jeton sur un compte Apify Solocal, validation DSI
+  (les URLs analysées sont envoyées à Apify), hébergement interne.
 
 ## Mise en ligne sur Streamlit Community Cloud
 
@@ -59,11 +69,11 @@ GOOGLE_NL_API_KEY = "AIza...votre_clé..."
    dépôt `outil-entites-serp`, branche `main`, fichier `app.py`.
 3. Dans **Advanced settings** : choisir Python 3.12, et coller dans **Secrets** :
    ```toml
-   GOOGLE_NL_API_KEY = "AIza...votre_clé..."
+   APIFY_TOKEN = "apify_api_..."
    APP_PASSWORD = "mot_de_passe_de_l_equipe"
    ```
 4. **Deploy**. Partager ensuite l'URL `https://….streamlit.app` et le mot de passe
    avec l'équipe.
 
 Sans `APP_PASSWORD`, l'app est accessible sans mot de passe (pratique en local).
-Pour changer la clé ou le mot de passe : réglages de l'app > Secrets, sans redéployer.
+Pour changer le jeton ou le mot de passe : réglages de l'app > Secrets, sans redéployer.

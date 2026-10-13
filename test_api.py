@@ -1,23 +1,20 @@
-"""Test rapide de l'API Natural Language, hors Streamlit.
-Usage : python test_api.py"""
+"""Test rapide de l'actor Apify « Entity SEO API », hors Streamlit.
+Affiche la réponse brute pour contrôler les champs renvoyés.
+Usage : python test_api.py [url]"""
+import json
 import os
+import sys
 import time
 
-import requests
+from apify_client import ApifyClient
 
-# --- Forcer l'IPv4 : sur certains réseaux, l'IPv6 vers Google ne répond pas
-import socket
-import urllib3.util.connection as _urllib3_cn
-_urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
-
-key = os.environ.get("GOOGLE_NL_API_KEY")
-print("Clé trouvée :", bool(key))
+token = os.environ.get("APIFY_TOKEN")
+actor = os.environ.get("APIFY_ACTOR_ID") or "EJWI6K70hv3VyAHvp"
+url = sys.argv[1] if len(sys.argv) > 1 else "https://fr.wikipedia.org/wiki/Marie_Curie"
+print("Jeton trouvé :", bool(token))
 t0 = time.time()
-r = requests.post(
-    "https://language.googleapis.com/v1/documents:analyzeEntities",
-    params={"key": key}, timeout=(10, 45),
-    json={"document": {"type": "PLAIN_TEXT",
-                       "content": "Bonifacio et Porto-Vecchio sont en Corse."},
-          "encodingType": "UTF8"})
-print(f"Réponse {r.status_code} en {time.time() - t0:.1f} s")
-print([e["name"] for e in r.json().get("entities", [])] or r.text[:300])
+client = ApifyClient(token)
+run = client.actor(actor).call(run_input={"urls": [url]})
+print(f"Statut {run.get('status')} en {time.time() - t0:.1f} s")
+for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+    print(json.dumps(item, ensure_ascii=False, indent=2)[:3000])

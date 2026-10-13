@@ -2,15 +2,14 @@
 Outil Entités SERP — prototype pour les équipes de rédaction
 
 1. « Entités à couvrir » : coller les URLs du top 10 (copiées depuis YTG)
-   → socle commun aux pages concurrentes, en deux familles :
-     - entités nommées (lieux, marques, personnes) avec MID Knowledge Graph ;
-     - concepts du sujet (noms communs : toiture, tuiles, zinguerie…).
+   → entités du Knowledge Graph que Google associe à chaque page (actor Apify
+     « Entity SEO API »), et socle commun aux pages concurrentes.
 2. « Vérifier mon brouillon » : coller son texte
-   → score de couverture des deux familles + ce qui manque.
+   → score de couverture + ce qui manque.
 
 Lancement :  streamlit run app.py
-Clé API   :  variable d'environnement GOOGLE_NL_API_KEY
-             (ou fichier .streamlit/secrets.toml : GOOGLE_NL_API_KEY = "AIza...")
+Jeton API :  variable d'environnement APIFY_TOKEN
+             (ou fichier .streamlit/secrets.toml : APIFY_TOKEN = "apify_api_...")
 """
 
 import hmac
@@ -20,11 +19,13 @@ import re
 import time
 import unicodedata
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import requests
 import streamlit as st
 import trafilatura
+from apify_client import ApifyClient
 
 # --- Forcer l'IPv4 : sur certains réseaux, l'IPv6 vers Google ne répond pas
 import socket
@@ -33,23 +34,25 @@ _urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
 
 st.set_page_config(page_title="Entités SERP", page_icon="🧭", layout="wide")
 
-NL_URL = "https://language.googleapis.com/v1/documents:analyzeEntities"
+ACTOR_PAR_DEFAUT = "EJWI6K70hv3VyAHvp"  # Entity SEO API (Apify)
+CACHE_TTL = 24 * 3600
 MAX_CHARS = 20000
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 
 
-def get_api_key():
-    key = os.environ.get("GOOGLE_NL_API_KEY")
-    if key:
-        return key
+def reglage(nom):
+    val = os.environ.get(nom)
+    if val:
+        return val
     try:
-        return st.secrets["GOOGLE_NL_API_KEY"]
+        return st.secrets[nom]
     except Exception:
         return None
 
 
-API_KEY = get_api_key()
+API_TOKEN = reglage("APIFY_TOKEN")
+ACTOR_ID = reglage("APIFY_ACTOR_ID") or ACTOR_PAR_DEFAUT
 
 
 def verifier_acces():
@@ -84,46 +87,10 @@ def norm(s):
     return re.sub(r"[^a-z0-9]+", " ", s).strip()
 
 
-# Mots de navigation / gabarit web, sans intérêt éditorial
-MOTS_VIDES = {
-    "accueil", "article", "articles", "avis", "commentaire", "commentaires",
-    "contact", "cookie", "cookies", "email", "e mail", "lien", "liens", "menu",
-    "merci", "newsletter", "page", "pages", "partage", "politique", "site",
-    "sites", "internet", "web", "chose", "choses", "fois", "cas", "exemple",
-    "personne", "personnes", "gens", "an", "ans", "annee", "annees", "jour",
-    "jours", "mois", "semaine", "heure", "heures", "minute", "minutes",
-}
-
-
-# Mots trop généraux pour guider la rédaction : décochés par défaut (re-cochables)
-GENERIQUES = {
-    "particulier", "professionnel", "entreprise", "societe", "service", "client",
-    "besoin", "demande", "qualite", "conseil", "etape", "changement", "proximite",
-    "partenaire", "coeur", "type", "regle", "zone", "vie", "experience",
-    "savoir faire", "projet", "delai", "travail", "equipe", "gerant", "contrainte",
-    "solution", "prix", "tarif", "cout", "offre", "domaine", "secteur", "region",
-    "ville", "commune", "alentour", "environ", "niveau", "moment", "temp", "part",
-    "question", "reponse", "information", "detail", "point", "aspect", "element",
-    "maniere", "facon", "raison", "objectif", "resultat", "probleme", "possibilite",
-    "satisfaction", "confiance", "disponibilite",
-}
-
-
 def singulier(mot):
     if len(mot) > 3 and mot[-1] in "sx" and not mot.endswith("ss"):
         return mot[:-1]
     return mot
-
-
-def cle_concept(nom):
-    """Clé de regroupement d'un concept : minuscules, sans accents, au singulier.
-    Renvoie None pour les termes trop courts, chiffrés ou de navigation."""
-    n = norm(nom)
-    if len(n) < 3 or any(c.isdigit() for c in n) or n in MOTS_VIDES:
-        return None
-    if len(n.split()) > 4:  # groupe nominal trop long : rarement réutilisable
-        return None
-    return " ".join(singulier(m) for m in n.split())
 
 
 @st.cache_data(show_spinner=False, ttl=24 * 3600)
@@ -142,103 +109,146 @@ def recuperer_texte(url):
     return texte[:MAX_CHARS], None
 
 
-def analyser(texte):
-    """Appel à l'API Natural Language, avec cache en mémoire de session
-    (pas de st.cache_data ici : on écarte cette piste du blocage)."""
-    cache = st.session_state.setdefault("_cache_nl", {})
-    cle = hash(texte)
-    if cle in cache:
-        return cache[cle]
-    t0 = time.time()
-    print("    → requête envoyée à Google…", flush=True)
+def _champ(d, *cles):
+    """Première valeur non vide parmi plusieurs noms de champ possibles."""
+    for k in cles:
+        v = d.get(k)
+        if v not in (None, "", [], {}):
+            return v
+    return None
+
+
+def cle_url(url):
+    """Clé de comparaison d'URL : sans protocole, sans www, sans / final."""
+    u = re.sub(r"^https?://(www\.)?", "", str(url).strip().lower())
+    return u.split("#")[0].rstrip("/")
+
+
+def lire_entite(e):
+    nom = _champ(e, "name", "entityName", "entity", "label", "title")
+    if not nom:
+        return None
+    score = _champ(e, "score", "confidence", "relevance", "relevanceScore", "salience")
     try:
-        r = requests.post(NL_URL, params={"key": API_KEY}, timeout=(10, 45), json={
-            "document": {"type": "PLAIN_TEXT", "content": texte[:MAX_CHARS]},
-            "encodingType": "UTF8"})
-    except requests.RequestException as e:
-        print(f"    ← échec après {time.time() - t0:.1f} s : {e!r}", flush=True)
-        raise RuntimeError(f"connexion à Google impossible ({e.__class__.__name__})")
-    print(f"    ← réponse {r.status_code} en {time.time() - t0:.1f} s", flush=True)
-    if r.status_code != 200:
-        raise RuntimeError(r.json().get("error", {}).get("message", r.text[:200]))
-    out = {"nommees": [], "concepts": []}
-    for e in r.json().get("entities", []):
-        meta = e.get("metadata", {})
-        if meta.get("mid"):  # entité du Knowledge Graph
-            out["nommees"].append({"nom": e["name"], "type": e.get("type", ""),
-                                   "saillance": e.get("salience", 0.0),
-                                   "mid": meta["mid"],
-                                   "mentions": len(e.get("mentions", [])),
-                                   "wikipedia": meta.get("wikipedia_url", "")})
+        score = float(score)
+    except (TypeError, ValueError):
+        score = 0.0
+    types = _champ(e, "type", "types", "entityType", "category")
+    if isinstance(types, list):
+        types = ", ".join(str(t) for t in types)
+    return {"nom": str(nom),
+            "id": str(_champ(e, "id", "mid", "kgId", "kgmid", "kgMid", "entityId",
+                             "knowledgeGraphId", "wikidataId") or norm(str(nom))),
+            "score": score,
+            "type": str(types or ""),
+            "description": str(_champ(e, "description", "desc", "detailedDescription") or ""),
+            "lien": str(_champ(e, "wikipediaUrl", "wikipedia", "wikiUrl", "wikidataUrl",
+                               "kgUrl", "link") or "")}
+
+
+def lire_items(items):
+    """Éléments du dataset Apify → {clé d'URL: {"entites": [...], "erreur": str|None}}.
+    Accepte un élément par page (avec une liste d'entités) ou un élément par entité."""
+    out = defaultdict(lambda: {"entites": [], "erreur": None})
+    for it in items:
+        url = _champ(it, "url", "inputUrl", "input_url", "pageUrl", "sourceUrl", "page")
+        if not url:
             continue
-        types_mentions = {m.get("type") for m in e.get("mentions", [])}
-        cle_c = cle_concept(e["name"])
-        if "COMMON" in types_mentions and cle_c:
-            out["concepts"].append({"nom": e["name"], "cle": cle_c,
-                                    "saillance": e.get("salience", 0.0),
-                                    "mentions": len(e.get("mentions", []))})
-    cache[cle] = out
+        page = out[cle_url(url)]
+        if _champ(it, "error", "errorMessage"):
+            page["erreur"] = str(_champ(it, "error", "errorMessage"))[:150]
+        ents = _champ(it, "entities", "knowledgeGraphEntities", "kgEntities", "results")
+        if isinstance(ents, list):
+            page["entites"] += [x for x in map(lire_entite, ents) if x]
+        else:
+            e = lire_entite(it)
+            if e:
+                page["entites"].append(e)
     return out
+
+
+@st.cache_resource
+def _cache_apify():
+    """Cache partagé {clé d'URL: (horodatage, résultat)} : une page déjà analysée
+    dans les dernières 24 h n'est pas refacturée."""
+    return {}
+
+
+def analyser_urls(urls):
+    """Lance l'actor Apify sur les URLs absentes du cache ; renvoie
+    ({url: [entités]}, {url: erreur}, éléments bruts du dernier appel)."""
+    cache, maintenant = _cache_apify(), time.time()
+    a_faire = [u for u in urls if not (cle_url(u) in cache
+               and maintenant - cache[cle_url(u)][0] < CACHE_TTL)]
+    bruts = []
+    if a_faire:
+        client = ApifyClient(API_TOKEN)
+        print(f"→ Apify : {len(a_faire)} URL(s) envoyée(s)", flush=True)
+        t0 = time.time()
+        run = client.actor(ACTOR_ID).call(run_input={"urls": a_faire})
+        if not run or not run.get("defaultDatasetId"):
+            raise RuntimeError("l'actor Apify n'a renvoyé aucun résultat")
+        if run.get("status") not in (None, "SUCCEEDED"):
+            raise RuntimeError(f"exécution Apify terminée avec le statut {run['status']}")
+        bruts = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+        print(f"← {len(bruts)} élément(s) en {time.time() - t0:.1f} s", flush=True)
+        lus = lire_items(bruts)
+        for u in a_faire:
+            res = lus.get(cle_url(u))
+            if res and res["entites"]:  # on ne garde pas les échecs en cache
+                cache[cle_url(u)] = (maintenant, res)
+            else:
+                cache.pop(cle_url(u), None)
+                lus.setdefault(cle_url(u), {"entites": [], "erreur": None})
+        resultats_neufs = lus
+    else:
+        resultats_neufs = {}
+    resultats, erreurs = {}, {}
+    for u in urls:
+        res = resultats_neufs.get(cle_url(u)) or cache.get(cle_url(u), (0, None))[1]
+        if res and res["entites"]:
+            resultats[u] = res["entites"]
+        else:
+            erreurs[u] = (res or {}).get("erreur") or "aucune entité renvoyée par Apify"
+    return resultats, erreurs, bruts
 
 
 def agreger(resultats):
-    """resultats = {url: [entités]} → groupes fusionnés par libellé normalisé
-    (ex. Bastia commune + Bastia arrondissement = une seule ligne)."""
-    par_mid = defaultdict(lambda: {"noms": Counter(), "urls": {}, "ment": Counter(),
-                                   "type": "", "wiki": ""})
-    for url, res in resultats.items():
-        for e in res["nommees"]:
-            g = par_mid[e["mid"]]
+    """resultats = {url: [entités]} → groupes fusionnés par libellé normalisé."""
+    par_id = defaultdict(lambda: {"noms": Counter(), "urls": {}, "type": "",
+                                  "description": "", "lien": ""})
+    for url, ents in resultats.items():
+        for e in ents:
+            g = par_id[e["id"]]
             g["noms"][e["nom"]] += 1
-            g["urls"][url] = max(g["urls"].get(url, 0), e["saillance"])
-            g["ment"][url] += e.get("mentions", 1)
+            g["urls"][url] = max(g["urls"].get(url, 0), e["score"])
             g["type"] = g["type"] or e["type"]
-            g["wiki"] = g["wiki"] or e["wikipedia"]
+            g["description"] = g["description"] or e["description"]
+            g["lien"] = g["lien"] or e["lien"]
 
     groupes = {}
-    for mid, g in par_mid.items():
+    for id_, g in par_id.items():
         libelle = g["noms"].most_common(1)[0][0]
         cle = norm(libelle)
         if cle not in groupes:
-            groupes[cle] = {"libelle": libelle, "mids": set(), "noms": set(),
-                            "urls": {}, "ment": Counter(), "type": g["type"],
-                            "wiki": g["wiki"], "famille": "Lieu / nom propre"}
+            groupes[cle] = {"libelle": libelle, "ids": set(), "noms": set(),
+                            "urls": {}, "type": g["type"], "description": g["description"],
+                            "lien": g["lien"], "famille": "Entité"}
         G = groupes[cle]
-        G["mids"].add(mid)
+        G["ids"].add(id_)
         G["noms"].update(g["noms"].keys())
         for u, s in g["urls"].items():
             G["urls"][u] = max(G["urls"].get(u, 0), s)
-        G["ment"].update(g["ment"])
     return list(groupes.values())
-
-
-def agreger_concepts(resultats):
-    """Regroupe les noms communs entre pages (singulier/pluriel, casse, accents)."""
-    groupes = defaultdict(lambda: {"noms": Counter(), "urls": {}, "mentions": 0,
-                                   "ment": Counter()})
-    for url, res in resultats.items():
-        for c in res["concepts"]:
-            g = groupes[c["cle"]]
-            g["noms"][c["nom"].lower()] += 1
-            g["urls"][url] = max(g["urls"].get(url, 0), c["saillance"])
-            g["mentions"] += c["mentions"]
-            g["ment"][url] += c["mentions"]
-    out = []
-    for cle, g in groupes.items():
-        out.append({"cle": cle, "libelle": g["noms"].most_common(1)[0][0],
-                    "noms": set(g["noms"]), "urls": g["urls"],
-                    "mentions": g["mentions"], "ment": g["ment"],
-                    "famille": "Notion"})
-    return out
 
 
 # ---------------------------------------------------------------- interface
 st.title("Entités SERP")
-st.caption("Les entités (lieux, marques, personnes…) que les pages du top 10 "
-           "traitent, et celles qui manquent à votre brouillon.")
+st.caption("Les entités du Knowledge Graph que Google associe aux pages du top 10, "
+           "et celles qui manquent à votre brouillon.")
 
-if not API_KEY:
-    st.error("Clé API absente : définir GOOGLE_NL_API_KEY (voir README).")
+if not API_TOKEN:
+    st.error("Jeton Apify absent : définir APIFY_TOKEN (voir README).")
     st.stop()
 
 onglet1, onglet2 = st.tabs(["1 · Entités à couvrir", "2 · Vérifier mon brouillon"])
@@ -272,36 +282,29 @@ with onglet1:
         if not urls:
             st.warning("Aucune URL valide.")
         else:
-            resultats, etat, textes = {}, [], {}
-            barre = st.progress(0.0, text="Analyse en cours…")
-            for i, url in enumerate(urls, 1):
-                barre.progress((i - 1) / len(urls), text=f"{i}/{len(urls)} · téléchargement de {url}")
-                print(f"[{i}/{len(urls)}] téléchargement {url}", flush=True)
-                texte, err = recuperer_texte(url)
-                if not err:
-                    textes[url] = texte
-                    barre.progress((i - 1) / len(urls), text=f"{i}/{len(urls)} · analyse Google ({len(texte)} car.)")
-                    print(f"    texte extrait : {len(texte)} car. → appel API", flush=True)
-                    try:
-                        resultats[url] = analyser(texte)
-                        print(f"    {len(resultats[url]['nommees'])} entités nommées · "
-                              f"{len(resultats[url]['concepts'])} concepts", flush=True)
-                    except Exception as e:
-                        err = f"erreur API : {e}"
-                if err:
-                    print(f"    ⚠ {err}", flush=True)
-                res = resultats.get(url, {"nommees": [], "concepts": []})
-                etat.append({"URL": url,
-                             "Statut": "✅" if not err else f"⚠ {err}",
-                             "Entités nommées": len(res["nommees"]),
-                             "Concepts": len(res["concepts"])})
-                barre.progress(i / len(urls), text=f"{i}/{len(urls)} pages analysées")
-            barre.empty()
+            with st.spinner(f"Analyse de {len(urls)} page(s) par Apify… "
+                            "(compter de quelques secondes à quelques minutes)"):
+                try:
+                    resultats, erreurs, bruts = analyser_urls(urls)
+                except Exception as e:
+                    st.error(f"Erreur Apify : {e}")
+                    st.stop()
+            # Texte des pages : sert seulement aux exemples et au nombre d'emplois
+            with st.spinner("Récupération du texte des pages pour les exemples…"):
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    textes = {u: t for u, (t, err) in
+                              zip(urls, pool.map(recuperer_texte, urls)) if not err}
             st.session_state["serp"] = resultats
-            st.session_state["etat"] = etat
             st.session_state["textes"] = textes
-            for k in ("socle", "socle_concepts"):
-                st.session_state.pop(k, None)
+            if bruts:
+                st.session_state["bruts"] = bruts
+            st.session_state["etat"] = [{
+                "URL": u,
+                "Statut": "✅" if u in resultats else f"⚠ {erreurs.get(u)}",
+                "Entités": len(resultats.get(u, [])),
+                "Texte récupéré": "oui" if u in textes else "non",
+            } for u in urls]
+            st.session_state.pop("socle", None)
 
     if st.session_state.get("serp"):
         resultats = st.session_state["serp"]
@@ -309,24 +312,27 @@ with onglet1:
         with st.expander(f"Pages analysées : {n} sur {len(st.session_state['etat'])}"):
             st.dataframe(pd.DataFrame(st.session_state["etat"]),
                          hide_index=True, width="stretch")
+        if st.session_state.get("bruts"):
+            with st.expander("Réponse brute d'Apify (contrôle)"):
+                st.json(st.session_state["bruts"][:3])
 
         if n > 1:
             seuil = st.slider("Présent dans au moins … pages", 1, n,
                               value=max(1, math.ceil(n / 3)))
         else:
             seuil = 1
-            st.caption("Une seule page analysée : tous ses éléments sont repris. "
+            st.caption("Une seule page analysée : toutes ses entités sont reprises. "
                        "Ajoutez d'autres URLs pour dégager un socle commun.")
         st.caption("Décochez ce qui est hors sujet (faux sens, pays étrangers, "
-                   "mots trop génériques) avant de vérifier un brouillon.")
+                   "termes trop génériques) avant de vérifier un brouillon.")
 
-        # --- entités nommées
         socle = sorted([g for g in agreger(resultats) if len(g["urls"]) >= seuil],
                        key=lambda g: (-len(g["urls"]), -sum(g["urls"].values())))
-        st.subheader(f"Entités nommées : {len(socle)}")
-        st.caption("Lieux, marques, organismes, personnes, rattachés au Knowledge Graph.")
+        st.subheader(f"Entités à couvrir : {len(socle)}")
+        st.caption("Entités du Knowledge Graph associées aux pages, avec leur score "
+                   "(0 à 100 : à quel point l'entité est centrale dans la page).")
         if not socle:
-            st.info("Aucune entité nommée à ce seuil.")
+            st.info("Aucune entité à ce seuil.")
             st.session_state["socle"] = []
         else:
             tableau_editable([{"groupe": g, "affichage": {
@@ -334,32 +340,11 @@ with onglet1:
                 "Entité": g["libelle"],
                 "Type": g["type"],
                 "Pages": f"{len(g['urls'])}/{n}",
-                "Saillance moy.": round(sum(g["urls"].values()) / len(g["urls"]), 4),
-                "Wikipédia": g["wiki"],
-                "MID": ", ".join(sorted(g["mids"])),
-            }} for g in socle], "socle", "entites_nommees.csv", ("Wikipédia",))
-
-        # --- concepts
-        concepts = sorted(
-            [c for c in agreger_concepts(resultats) if len(c["urls"]) >= seuil],
-            key=lambda c: (-len(c["urls"]), -sum(c["urls"].values())))[:60]
-        st.subheader(f"Concepts du sujet : {len(concepts)}")
-        st.caption("Noms communs que les pages traitent (ex. toiture, tuiles, "
-                   "démoussage). Limité aux 60 premiers. Les mots trop généraux "
-                   "(entreprise, besoin, qualité…) sont décochés d'office : "
-                   "recochez-les s'ils comptent pour votre sujet.")
-        if not concepts:
-            st.info("Aucun concept à ce seuil.")
-            st.session_state["socle_concepts"] = []
-        else:
-            tableau_editable([{"groupe": c, "affichage": {
-                "Garder": c["cle"] not in GENERIQUES,
-                "Concept": c["libelle"],
-                "Pages": f"{len(c['urls'])}/{n}",
-                "Mentions": c["mentions"],
-                "Saillance moy.": round(sum(c["urls"].values()) / len(c["urls"]), 4),
-                "Variantes": ", ".join(sorted(c["noms"]))[:80],
-            }} for c in concepts], "socle_concepts", "concepts.csv")
+                "Score moy.": round(sum(g["urls"].values()) / len(g["urls"]), 1),
+                "Description": g["description"],
+                "Lien": g["lien"],
+                "ID": ", ".join(sorted(g["ids"])),
+            }} for g in socle], "socle", "entites.csv", ("Lien",))
 
 # ---------- onglet 2
 def formes_de(noms):
@@ -426,41 +411,35 @@ def carte_manquant(it):
 
 with onglet2:
     socle = st.session_state.get("socle") or []
-    socle_c = st.session_state.get("socle_concepts") or []
-    if not socle and not socle_c:
-        st.info("Commencez par l'onglet 1 pour définir les éléments de référence.")
+    if not socle:
+        st.info("Commencez par l'onglet 1 pour définir les entités de référence.")
     else:
         n_pages = len(st.session_state.get("serp", {})) or 1
         textes = st.session_state.get("textes", {})
-        st.caption(f"Référence : {len(socle) + len(socle_c)} éléments tirés de "
+        textes_norm = {u: f" {norm(t)} " for u, t in textes.items()}
+        st.caption(f"Référence : {len(socle)} entités tirées de "
                    f"{n_pages} pages concurrentes.")
         brouillon = st.text_area("Collez votre brouillon", height=250)
 
         if st.button("Analyser mon brouillon", type="primary") and brouillon.strip():
-            try:
-                res_b = analyser(brouillon)
-            except RuntimeError as e:
-                st.error(f"Erreur API : {e}")
-                st.stop()
-            mids_b = {e["mid"] for e in res_b["nommees"]}
-            cles_b = {c["cle"] for c in res_b["concepts"]}
             texte_norm = f" {norm(brouillon)} "
 
             items = []
-            for g in socle + socle_c:
+            for g in socle:
                 formes = formes_de(g["noms"])
                 nb = compter(formes, texte_norm)
-                detecte = bool(g.get("mids", set()) & mids_b) or g.get("cle") in cles_b
                 part = len(g["urls"]) / n_pages
                 prio, couleur = priorite(part)
-                ments = sorted(g["ment"].values()) or [0]
+                # emplois par page chez les concurrents dont on a le texte
+                ments = sorted(compter(formes, textes_norm[u])
+                               for u in g["urls"] if u in textes_norm) or [0]
                 med = ments[len(ments) // 2]
                 urls_triees = sorted(g["urls"], key=lambda u: -g["urls"][u])
                 items.append({
                     "libelle": g["libelle"], "famille": g["famille"],
                     "pages": len(g["urls"]), "n": n_pages, "part": part,
                     "priorite": prio, "couleur": couleur, "med": med,
-                    "nb": max(nb, 1 if detecte else 0), "formes": formes,
+                    "nb": nb, "formes": formes,
                     "noms": g["noms"],
                     "urls_triees": urls_triees, "extrait": None, "source": None,
                 })
@@ -482,7 +461,7 @@ with onglet2:
             n_ind = len(manq_prio["Indispensable"])
             n_rec = len(manq_prio["Recommandé"])
             if n_ind == 0 and n_rec == 0 and not a_developper:
-                st.success("Votre brouillon couvre tous les éléments importants de la SERP.")
+                st.success("Votre brouillon couvre toutes les entités importantes de la SERP.")
             else:
                 morceaux = []
                 if n_ind:
