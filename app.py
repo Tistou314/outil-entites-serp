@@ -19,6 +19,7 @@ import unicodedata
 from collections import Counter, defaultdict
 
 import pandas as pd
+import requests
 import streamlit as st
 from apify_client import ApifyClient
 
@@ -90,25 +91,22 @@ def cle_url(url):
 
 
 def lire_entite(e):
-    nom = _champ(e, "name", "entityName", "entity", "label", "title")
-    if not nom:
+    """Entité de l'actor : {"entity_id": "/m/…", "score": 71, "name": …, "description": …}.
+    Le nom peut être vide, ou être un identifiant Wikidata (« Q56319964 »)."""
+    id_ = _champ(e, "entity_id", "id", "mid", "kgId", "entityId")
+    nom = _champ(e, "name", "entityName", "label")
+    if not id_ and not nom:
         return None
-    score = _champ(e, "score", "confidence", "relevance", "relevanceScore", "salience")
     try:
-        score = float(score)
+        score = float(_champ(e, "score", "confidence") or 0)
     except (TypeError, ValueError):
         score = 0.0
-    types = _champ(e, "type", "types", "entityType", "category")
-    if isinstance(types, list):
-        types = ", ".join(str(t) for t in types)
-    return {"nom": str(nom),
-            "id": str(_champ(e, "id", "mid", "kgId", "kgmid", "kgMid", "entityId",
-                             "knowledgeGraphId", "wikidataId") or norm(str(nom))),
+    nom = str(nom or "")
+    qid = nom if re.fullmatch(r"Q\d+", nom) else None
+    return {"id": str(id_ or norm(nom)), "qid": qid,
+            "nom": "" if qid else nom, "nom_en": "" if qid else nom,
             "score": score,
-            "type": str(types or ""),
-            "description": str(_champ(e, "description", "desc", "detailedDescription") or ""),
-            "lien": str(_champ(e, "wikipediaUrl", "wikipedia", "wikiUrl", "wikidataUrl",
-                               "kgUrl", "link") or "")}
+            "description": str(_champ(e, "description") or ""), "lien": ""}
 
 
 def lire_items(items):
@@ -193,18 +191,103 @@ def analyser_urls(urls):
     return resultats, erreurs, bruts
 
 
+WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
+WIKIDATA_UA = "OutilEntitesSERP/1.0 (https://github.com/Tistou314/outil-entites-serp)"
+
+
+@st.cache_resource
+def _cache_wikidata():
+    """{identifiant: fiche Wikidata (dict) ou None si absente} — libellés stables."""
+    return {}
+
+
+def requete_wikidata(ids_kg, qids):
+    """Fiches Wikidata des identifiants Knowledge Graph (/m/… via P646, /g/… via
+    P2671) et des identifiants Wikidata déjà connus. Renvoie {identifiant: fiche}."""
+    branches = []
+    if ids_kg:
+        valeurs = " ".join(f'"{i}"' for i in ids_kg)
+        branches.append(f"{{ VALUES ?id {{ {valeurs} }} ?item wdt:P646|wdt:P2671 ?id . }}")
+    if qids:
+        valeurs = " ".join(f'("{i}" wd:{q})' for i, q in qids.items())
+        branches.append(f"{{ VALUES (?id ?item) {{ {valeurs} }} }}")
+    requete = """PREFIX wd: <http://www.wikidata.org/entity/>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX schema: <http://schema.org/>
+SELECT ?id ?item ?fr ?en ?dfr ?den ?article WHERE {
+  %s
+  OPTIONAL { ?item rdfs:label ?fr . FILTER(LANG(?fr) = "fr") }
+  OPTIONAL { ?item rdfs:label ?en . FILTER(LANG(?en) = "en") }
+  OPTIONAL { ?item schema:description ?dfr . FILTER(LANG(?dfr) = "fr") }
+  OPTIONAL { ?item schema:description ?den . FILTER(LANG(?den) = "en") }
+  OPTIONAL { ?article schema:about ?item ;
+                      schema:isPartOf <https://fr.wikipedia.org/> . }
+}""" % "\n  UNION ".join(branches)
+    r = requests.post(WIKIDATA_SPARQL, data={"query": requete}, timeout=(10, 60),
+                      headers={"Accept": "application/sparql-results+json",
+                               "User-Agent": WIKIDATA_UA})
+    r.raise_for_status()
+    fiches = {}
+    for ligne in r.json()["results"]["bindings"]:
+        v = {k: x["value"] for k, x in ligne.items()}
+        fiche = fiches.setdefault(v["id"], {"qid": v["item"].rsplit("/", 1)[-1]})
+        for cle in ("fr", "en", "dfr", "den", "article"):
+            if v.get(cle) and not fiche.get(cle):
+                fiche[cle] = v[cle]
+    return fiches
+
+
+def franciser(resultats):
+    """Remplace nom et description par ceux de Wikidata en français (repli : anglais),
+    ajoute le lien Wikipédia FR. Renvoie (résultats, message d'erreur ou None)."""
+    cache = _cache_wikidata()
+    ents = [e for liste in resultats.values() for e in liste]
+    manquants = {e["id"]: e["qid"] for e in ents if e["id"] not in cache}
+    erreur = None
+    ids = list(manquants)
+    for i in range(0, len(ids), 150):
+        lot = ids[i:i + 150]
+        try:
+            fiches = requete_wikidata([x for x in lot if x.startswith(("/m/", "/g/"))],
+                                      {x: manquants[x] for x in lot if manquants[x]})
+        except Exception as ex:
+            erreur = f"Wikidata injoignable ({ex.__class__.__name__}) : noms laissés en anglais"
+            break
+        for x in lot:
+            cache[x] = fiches.get(x)
+    sortie = {}
+    for url, liste in resultats.items():
+        sortie[url] = []
+        for e in liste:
+            f = cache.get(e["id"]) or {}
+            e = dict(e)
+            e["nom_en"] = e["nom_en"] or f.get("en", "")
+            e["nom"] = f.get("fr") or e["nom"] or f.get("en", "")
+            e["description"] = f.get("dfr") or e["description"] or f.get("den", "")
+            e["lien"] = f.get("article") or (
+                f"https://www.wikidata.org/wiki/{f['qid']}" if f.get("qid") else "")
+            e["qid"] = f.get("qid") or e["qid"]
+            sortie[url].append(e)
+    return sortie, erreur
+
+
+def lien_google(id_):
+    return f"https://www.google.com/search?kgmid={id_}"
+
+
 def agreger(resultats):
-    """resultats = {url: [entités]} → groupes fusionnés par libellé normalisé."""
-    par_id = defaultdict(lambda: {"noms": Counter(), "urls": {}, "type": "",
+    """resultats = {url: [entités nommées]} → groupes fusionnés par libellé normalisé."""
+    par_id = defaultdict(lambda: {"noms": Counter(), "urls": {}, "nom_en": "",
                                   "description": "", "lien": ""})
     for url, ents in resultats.items():
         for e in ents:
             g = par_id[e["id"]]
             g["noms"][e["nom"]] += 1
             g["urls"][url] = max(g["urls"].get(url, 0), e["score"])
-            g["type"] = g["type"] or e["type"]
+            g["nom_en"] = g["nom_en"] or e["nom_en"]
             g["description"] = g["description"] or e["description"]
-            g["lien"] = g["lien"] or e["lien"]
+            g["lien"] = g["lien"] or e["lien"] or lien_google(e["id"])
 
     groupes = {}
     for id_, g in par_id.items():
@@ -212,14 +295,24 @@ def agreger(resultats):
         cle = norm(libelle)
         if cle not in groupes:
             groupes[cle] = {"libelle": libelle, "ids": set(), "noms": set(),
-                            "urls": {}, "type": g["type"], "description": g["description"],
-                            "lien": g["lien"]}
+                            "urls": {}, "nom_en": g["nom_en"],
+                            "description": g["description"], "lien": g["lien"]}
         G = groupes[cle]
         G["ids"].add(id_)
         G["noms"].update(g["noms"].keys())
         for u, s in g["urls"].items():
             G["urls"][u] = max(G["urls"].get(u, 0), s)
     return list(groupes.values())
+
+
+def sans_nom(resultats):
+    """Entités que ni l'actor ni Wikidata ne savent nommer, regroupées par identifiant."""
+    groupes = defaultdict(dict)
+    for url, ents in resultats.items():
+        for e in ents:
+            if not e["nom"]:
+                groupes[e["id"]][url] = max(groupes[e["id"]].get(url, 0), e["score"])
+    return groupes
 
 
 # ---------------------------------------------------------------- interface
@@ -265,7 +358,10 @@ if st.button("Analyser la SERP", type="primary"):
             except Exception as e:
                 st.error(f"Erreur Apify : {e}")
                 st.stop()
+        with st.spinner("Noms et descriptions en français (Wikidata)…"):
+            resultats, erreur_wd = franciser(resultats)
         st.session_state["serp"] = resultats
+        st.session_state["erreur_wd"] = erreur_wd
         if bruts:
             st.session_state["bruts"] = bruts
         st.session_state["etat"] = [{
@@ -278,6 +374,8 @@ if st.button("Analyser la SERP", type="primary"):
 if st.session_state.get("serp"):
     resultats = st.session_state["serp"]
     n = len(resultats)
+    if st.session_state.get("erreur_wd"):
+        st.warning(st.session_state["erreur_wd"])
     with st.expander(f"Pages analysées : {n} sur {len(st.session_state['etat'])}"):
         st.dataframe(pd.DataFrame(st.session_state["etat"]),
                      hide_index=True, width="stretch")
@@ -295,11 +393,13 @@ if st.session_state.get("serp"):
     st.caption("Décochez ce qui est hors sujet (faux sens, pays étrangers, "
                "termes trop génériques) avant de télécharger la liste.")
 
-    socle = sorted([g for g in agreger(resultats) if len(g["urls"]) >= seuil],
+    nommees = {u: [e for e in ents if e["nom"]] for u, ents in resultats.items()}
+    socle = sorted([g for g in agreger(nommees) if len(g["urls"]) >= seuil],
                    key=lambda g: (-len(g["urls"]), -sum(g["urls"].values())))
     st.subheader(f"Entités à couvrir : {len(socle)}")
     st.caption("Entités du Knowledge Graph associées aux pages, avec leur score "
-               "(0 à 100 : à quel point l'entité est centrale dans la page).")
+               "(0 à 100 : à quel point l'entité est centrale dans la page). "
+               "Noms et descriptions en français tirés de Wikidata quand ils existent.")
     if not socle:
         st.info("Aucune entité à ce seuil.")
         st.session_state["socle"] = []
@@ -307,10 +407,25 @@ if st.session_state.get("serp"):
         tableau_editable([{"groupe": g, "affichage": {
             "Garder": True,
             "Entité": g["libelle"],
-            "Type": g["type"],
+            "Nom d'origine (EN)": g["nom_en"] if norm(g["nom_en"]) != norm(g["libelle"]) else "",
             "Pages": f"{len(g['urls'])}/{n}",
             "Score moy.": round(sum(g["urls"].values()) / len(g["urls"]), 1),
             "Description": g["description"],
             "Lien": g["lien"],
             "ID": ", ".join(sorted(g["ids"])),
         }} for g in socle], "socle", "entites.csv", ("Lien",))
+
+    inconnues = {i: u for i, u in sans_nom(resultats).items() if len(u) >= seuil}
+    if inconnues:
+        with st.expander(f"Entités sans nom : {len(inconnues)}"):
+            st.caption("Google les associe aux pages, mais ni l'actor ni Wikidata ne "
+                       "les nomment. Le lien ouvre la fiche Google de l'entité.")
+            st.dataframe(pd.DataFrame([{
+                "ID": i,
+                "Pages": f"{len(u)}/{n}",
+                "Score moy.": round(sum(u.values()) / len(u), 1),
+                "Lien Google": lien_google(i),
+            } for i, u in sorted(inconnues.items(),
+                                 key=lambda x: (-len(x[1]), -sum(x[1].values())))]),
+                hide_index=True, width="stretch",
+                column_config={"Lien Google": st.column_config.LinkColumn()})

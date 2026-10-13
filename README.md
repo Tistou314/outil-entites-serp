@@ -41,6 +41,13 @@ télécharger la liste (CSV).
   secondes à quelques minutes selon le nombre de pages.
 - Les résultats par URL sont gardés en cache 24 h pour ne pas refacturer les mêmes pages
   (les échecs ne sont pas mis en cache).
+- Noms et descriptions en français : l'identifiant Knowledge Graph de chaque entité
+  (`/m/…`, `/g/…`) est retrouvé dans Wikidata (propriétés P646 et P2671), qui fournit
+  le libellé et la description en français et le lien Wikipédia FR. Sans fiche
+  française, le nom anglais est gardé ; le nom d'origine reste visible dans le tableau.
+  Si Wikidata ne répond pas, un avertissement s'affiche et les noms restent en anglais.
+- Les entités que ni l'actor ni Wikidata ne nomment sont listées à part
+  (« Entités sans nom »), avec un lien vers leur fiche Google.
 - La réponse brute d'Apify est consultable dans l'onglet 1 (« Réponse brute d'Apify »)
   pour contrôler les champs renvoyés.
 - Coût : facturé par Apify selon la tarification de l'actor (les URLs en échec ne sont
