@@ -1,8 +1,7 @@
 # Entités SERP — prototype
 
 Outil pour les rédacteurs : à partir des URLs du top 10 (copiées depuis le guide YTG),
-il liste les entités du Knowledge Graph que Google associe aux pages concurrentes,
-puis vérifie qu'un brouillon les couvre.
+il liste les entités du Knowledge Graph que Google associe aux pages concurrentes.
 
 L'analyse des pages passe par l'actor Apify **Entity SEO API**
 (ID `EJWI6K70hv3VyAHvp`) : pour chaque URL, il renvoie les entités du Knowledge Graph
@@ -32,11 +31,9 @@ Test rapide hors Streamlit (affiche la réponse brute) : `python test_api.py [ur
 
 ## Utilisation
 
-1. **Entités à couvrir** : coller les URLs du top 10, cliquer sur « Analyser la SERP ».
-   Régler le seuil (nombre minimum de pages qui citent l'entité), décocher les entités
-   hors sujet.
-2. **Vérifier mon brouillon** : coller le texte, cliquer sur « Analyser mon brouillon ».
-   L'outil affiche la couverture et les entités à ajouter ou à développer.
+Coller les URLs du top 10, cliquer sur « Analyser la SERP ». Régler le seuil (nombre
+minimum de pages qui citent l'entité), décocher les entités hors sujet, puis
+télécharger la liste (CSV).
 
 ## Notes
 
@@ -44,10 +41,6 @@ Test rapide hors Streamlit (affiche la réponse brute) : `python test_api.py [ur
   secondes à quelques minutes selon le nombre de pages.
 - Les résultats par URL sont gardés en cache 24 h pour ne pas refacturer les mêmes pages
   (les échecs ne sont pas mis en cache).
-- Le texte des pages est aussi récupéré en local, uniquement pour montrer un exemple
-  d'emploi par un concurrent et compter les emplois par page (« À développer »).
-- Le brouillon n'est envoyé à aucune API : une entité est comptée comme couverte si son
-  nom y figure (au singulier ou au pluriel).
 - La réponse brute d'Apify est consultable dans l'onglet 1 (« Réponse brute d'Apify »)
   pour contrôler les champs renvoyés.
 - Coût : facturé par Apify selon la tarification de l'actor (les URLs en échec ne sont
